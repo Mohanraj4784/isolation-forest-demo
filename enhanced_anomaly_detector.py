@@ -9,9 +9,9 @@ import pickle
 import os
 import time
 from collections import deque, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from river import anomaly, ensemble
-from typing import Dict, Tuple, List
+from typing import Dict, Tuple, List, Any
 import config
 from FilePersistence import FileModelPersistence
 
@@ -53,6 +53,10 @@ class EnhancedLogAnomalyDetector:
         
         # Feature cache for expensive computations
         self.feature_cache = {}
+        
+        # --- Warm-up training state ---
+        self.training_only = True            # Until the model sees enough normal logs
+        self.training_samples = 0            # Count of warm-up samples
         
         logger.info("✅ Enhanced Log Anomaly Detector initialized!")
     
@@ -112,9 +116,34 @@ class EnhancedLogAnomalyDetector:
         # Error rate calculation
         error_rate = metrics['error_count'] / max(metrics['total_count'], 1)
         
-        # Request frequency (logs per minute estimate)
-        recent_logs = [log for log in self.log_history if log.get('service') == service]
-        request_frequency = len(recent_logs) / max(1, config.LOG_HISTORY_SIZE / 60)
+        # Request frequency: logs per minute over the last N minutes
+        now = datetime.utcnow()
+        window_minutes = 5  # can be made configurable if needed
+
+        recent_logs = []
+        for log in self.log_history:
+            if log.get("service") != service:
+                continue
+
+            ts = log.get("timestamp")
+            if isinstance(ts, str):
+                # Convert ISO string to datetime; handle trailing 'Z'
+                try:
+                    ts_parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    # Convert timezone-aware to naive UTC for comparison
+                    if ts_parsed.tzinfo is not None:
+                        ts = ts_parsed.replace(tzinfo=None)
+                    else:
+                        ts = ts_parsed
+                except Exception:
+                    continue
+
+            if isinstance(ts, datetime):
+                if (now - ts).total_seconds() <= window_minutes * 60:
+                    recent_logs.append(log)
+
+        # Requests per minute in the last 'window_minutes'
+        request_frequency = len(recent_logs) / max(window_minutes, 1)
         
         return [
             self.scale(avg_response, 0, 10),
@@ -282,78 +311,111 @@ class EnhancedLogAnomalyDetector:
             return config.UPDATE_FREQUENCY["NORMAL"]
     
     def process_log(self, log_request: Dict) -> Tuple[str, float]:
-        """Process a log entry and detect anomalies"""
+        """Process a log entry and detect anomalies with warm-up logic."""
         start_time = time.time()
-        
+
         # Extract features
         features = self.extract_features(log_request)
         instance = {i: feature for i, feature in enumerate(features)}
-        
-        # Get anomaly scores from all models
+
+        # --------------------------
+        # 1. WARM-UP MODE
+        # --------------------------
+        if self.training_only:
+            for model_name, model in self.classifier:
+                try:
+                    model.learn_one(instance)
+                except Exception as e:
+                    logger.error(f"Warm-up learning error [{model_name}]: {e}")
+
+            self.training_samples += 1
+            self.processed_count += 1
+            # Ensure log has timestamp before appending
+            if "timestamp" not in log_request:
+                log_request["timestamp"] = datetime.utcnow().isoformat() + "Z"
+            self.log_history.append(log_request)
+
+            # Exit warm-up when threshold reached
+            if self.training_samples >= config.MIN_TRAINING_SAMPLES:
+                self.training_only = False
+                logger.info(
+                    f"🟢 Warm-up complete: {self.training_samples} samples. "
+                    f"Switching to anomaly detection mode."
+                )
+
+            # During warm-up: always return NORMAL with score=0.0
+            return "NORMAL", 0.0
+
+        # --------------------------
+        # 2. SCORING PHASE
+        # --------------------------
         anomaly_scores = []
         for model_name, model in self.classifier:
             try:
                 score = model.score_one(instance)
                 anomaly_scores.append(score)
             except Exception as e:
-                logger.error(f"Error scoring with {model_name}: {e}")
+                logger.error(f"Scoring error [{model_name}]: {e}")
                 anomaly_scores.append(0.0)
-        
-        # Ensemble: weighted average
-        anomaly_score = np.mean(anomaly_scores) if anomaly_scores else 0.0
-        
-        # Update models (incremental learning)
-        for model_name, model in self.classifier:
-            try:
-                model.learn_one(instance)
-            except Exception as e:
-                logger.error(f"Error learning with {model_name}: {e}")
-        
-        # Update histories
-        self.feedback_history.append(anomaly_score)
-        self.log_history.append(log_request)
-        self.processed_count += 1
-        
-        # Get adaptive threshold
+
+        anomaly_score = float(np.mean(anomaly_scores)) if anomaly_scores else 0.0
+
+        # Threshold
         service_name = log_request.get("service", "unknown")
         threshold = self.get_adaptive_threshold(service_name)
-        
-        # Make decision
+
+        # Final decision
         is_anomaly = anomaly_score > threshold
         decision = "ANOMALY" if is_anomaly else "NORMAL"
-        
-        # Update anomaly tracking
+
+        # --------------------------
+        # 3. SAFE ONLINE LEARNING
+        # --------------------------
+        # Learn ONLY IF the log was classified NORMAL
+        if not is_anomaly:
+            for model_name, model in self.classifier:
+                try:
+                    model.learn_one(instance)
+                except Exception as e:
+                    logger.error(f"Online learn error [{model_name}]: {e}")
+
+        # Histories
+        self.feedback_history.append(anomaly_score)
+        # Ensure log has timestamp before appending
+        if "timestamp" not in log_request:
+            log_request["timestamp"] = datetime.utcnow().isoformat() + "Z"
+        self.log_history.append(log_request)
+        self.processed_count += 1
+
+        # Track anomaly
         self.anomaly_history.append(1 if is_anomaly else 0)
         if is_anomaly:
             self.anomaly_count += 1
-            self.service_metrics[service_name]['error_count'] += 1
-            self.service_metrics[service_name]['last_anomaly_time'] = datetime.now()
+            self.service_metrics[service_name]["error_count"] += 1
+            self.service_metrics[service_name]["last_anomaly_time"] = datetime.now()
             logger.warning(
-                f"🚨 Anomaly detected in {service_name} "
-                f"({log_request.get('method', 'unknown')}): "
+                f"🚨 Anomaly detected in {service_name}: "
                 f"Score={anomaly_score:.3f}, Threshold={threshold:.3f}"
             )
-        
-        # Detect slow trends
-        self.detect_slow_trends()
-        
-        # Adaptive model saving
+
+        # --------------------------
+        # 4. ADAPTIVE SAVE FREQUENCY
+        # --------------------------
         update_freq = self.get_update_frequency()
         if (self.processed_count - self.last_save_count) >= update_freq:
             self.save_model()
             self.last_save_count = self.processed_count
-        
-        processing_time = time.time() - start_time
-        
+
+        # Log system metrics
         if config.ENABLE_METRICS:
+            duration = (time.time() - start_time) * 1000
             logger.info(
-                f"Processed log in {processing_time*1000:.2f}ms | "
-                f"Score: {anomaly_score:.3f} | "
-                f"Threshold: {threshold:.3f} | "
-                f"Decision: {decision} | "
-                f"Total processed: {self.processed_count}"
+                f"Processed log in {duration:.2f}ms | "
+                f"Score={anomaly_score:.3f} | "
+                f"Threshold={threshold:.3f} | "
+                f"Decision={decision}"
             )
-        
+
         return decision, anomaly_score
     
     def detect_slow_trends(self):
@@ -417,4 +479,93 @@ class EnhancedLogAnomalyDetector:
             pass
         
         return stats
+    
+    def get_calibration_snapshot(self) -> Dict[str, Any]:
+        """
+        Returns a snapshot of anomaly-score distribution and thresholds,
+        both globally and per service, to aid threshold calibration.
+        """
+        # Global scores
+        scores = list(self.feedback_history)
+        total = len(scores)
+
+        if total > 0:
+            avg_score = float(np.mean(scores))
+            p95_score = float(np.percentile(scores, 95))
+            max_score = float(np.max(scores))
+        else:
+            avg_score = p95_score = max_score = 0.0
+
+        total_anomalies = int(self.anomaly_count)
+        total_processed = int(self.processed_count)
+        global_anomaly_rate = (
+            total_anomalies / total_processed if total_processed > 0 else 0.0
+        )
+
+        # Build per-service stats
+        per_service: Dict[str, Any] = {}
+        # Collect unique services from service_metrics and log_history
+        services = set(self.service_metrics.keys()) | {
+            log.get("service", "unknown") for log in self.log_history
+        }
+
+        for service in services:
+            if not service:
+                continue
+
+            # Scores for this service by aligning feedback_history and log_history
+            svc_scores: List[float] = []
+            for score, log in zip(self.feedback_history, self.log_history):
+                if log.get("service", "unknown") == service:
+                    svc_scores.append(score)
+
+            svc_total = len(svc_scores)
+            if svc_total > 0:
+                svc_avg = float(np.mean(svc_scores))
+                svc_p95 = float(np.percentile(svc_scores, 95))
+                svc_max = float(np.max(svc_scores))
+            else:
+                svc_avg = svc_p95 = svc_max = 0.0
+
+            metrics = self.service_metrics.get(service, {})
+            error_count = int(metrics.get("error_count", 0))
+            total_count = int(metrics.get("total_count", 0))
+            last_anomaly_time = metrics.get("last_anomaly_time")
+
+            svc_anomaly_rate = (
+                error_count / total_count if total_count > 0 else 0.0
+            )
+
+            threshold = self.get_adaptive_threshold(service)
+
+            per_service[service] = {
+                "avg_score": svc_avg,
+                "p95_score": svc_p95,
+                "max_score": svc_max,
+                "threshold": float(threshold),
+                "error_count": error_count,
+                "total_count": total_count,
+                "anomaly_rate": svc_anomaly_rate,
+                "last_anomaly_time": (
+                    last_anomaly_time.isoformat() if last_anomaly_time else None
+                ),
+            }
+
+        snapshot = {
+            "global": {
+                "warmup_active": self.training_only,
+                "training_samples": int(
+                    getattr(self, "training_samples", 0)
+                ),
+                "avg_score": avg_score,
+                "p95_score": p95_score,
+                "max_score": max_score,
+                "total_processed": total_processed,
+                "total_anomalies": total_anomalies,
+                "global_anomaly_rate": global_anomaly_rate,
+            },
+            "per_service": per_service,
+        }
+
+        return snapshot
 

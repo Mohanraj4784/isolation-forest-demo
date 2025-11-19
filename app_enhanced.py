@@ -248,6 +248,18 @@ def get_config():
         "save_interval": config.SAVE_INTERVAL,
     }
 
+@app.get("/v1/ai/logs/debug/calibration")
+async def get_log_anomaly_calibration():
+    """
+    Debug endpoint: returns anomaly score distribution and thresholds
+    per service, to help calibrate Isolation Forest / streaming models.
+    """
+    snapshot = detector.get_calibration_snapshot()
+    return {
+        "status": "ok",
+        "data": snapshot,
+    }
+
 # Run the FastAPI server
 if __name__ == "__main__":
     import uvicorn
