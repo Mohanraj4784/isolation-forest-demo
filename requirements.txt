@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+river
+numpy
+scikit-learn
+pydantic
+mysql.connector
+pymysql
